@@ -1,0 +1,487 @@
+---
+title: "Global Suicide Rate Analysis"
+author: "Qinyang Fang (qfang4) Siqi Gu (siqig2) Jinran Shi (jinrans2) Siyuan Teng (siyuant2)" 
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document: 
+    theme: cosmo
+    toc: yes
+  pdf_document: default
+urlcolor: BrickRed
+---
+
+```{r, setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.align = "center", 
+                      cache = TRUE, autodep = TRUE)
+```
+
+```{r, load-packages, include = FALSE, message = FALSE} 
+library(dplyr)
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(MLmetrics)
+library(e1071)
+library(ggplot2)
+library(gbm)
+library(sqldf)
+library(kableExtra)
+library(nnet)
+library(doParallel)
+```
+
+```{r, ggplot-theme}
+theme_set(theme_light())
+```
+
+```{r, setup-parallel}
+registerDoParallel(cores = 4)
+```
+
+***
+
+# Abstract
+
+> Statistical learning methods were applied to global suicide dataset in order to predict suicide rate in the future. A variety of learning techniques were explored and validated, such as logistic regression and classification models, but ultimately the prediction power of the models appears to be limited by the available data and models. Additional data collection is recommended. 
+
+***
+
+# Introduction
+Suicide, as one of the leading cause of death, is the behavior of intentionally causing one's own death. Nowadays, as the society develops at an increasingly rapid rate, more suicide incidents occur due to the increasing amount of stress and mental disorder illness including depression, anxiety disorders and so on. 
+
+To construct a system to analyze the suicide rate in different countries, age group, sex, classify the data and predict the rate in the future, statistical learning techniques have been applied to a dataset containing the suicide data from 2000 to 2016. The results show potential for such a system to be used to analyze the relationship between age, sex, country GDP per capital and the suicide rate and then to predict the rate in each country, especially given that the dataset utilized is from the official dataset provided by WHO. The results indicate that this prediction can be made with a reasonably small amount of error. However, practical and statistical limitations suggest the need for further investigation.
+
+***
+
+# Methods
+
+## Data
+
+This *Kaggle* [^1] dataset pulled from four other datasets: United Nations Development Program [^2], World Bank [^3], Suicide in the Twenty-First Century [^4], and World Health Organization [^5] and summarized a set of potenial factors that influence the suicide rates across the world.
+
+There are a total of 12 variables with 27,820 observations. 
+
+Attribute Information is listed below (The target variable is highlighted in red):
+
+*See Appendix for variable description
+
+- country
+- year
+- sex
+- age
+- suicides_no
+- population
+- suicide/100k pop
+- country-year
+- HDI for year
+- gdp_for_year ($) 
+- gdp_per_capita ($)
+- generation
+
+Variable `suicide/100k pop` is calculated from `suicides_no` and `population`, so both variables are eliminated due to collinearity. Also, `country-year` replicates variables `country` and `year` and is removed. `Gdp_for_year ($)` is also not considered since it is directly linked to `gdp_per_capita ($)`. `Generation` is an approximate variable similar to `age`, so we will also not consider generation. Therefore, the final dataset includes 7 variables.  
+In order to do classification of suicide rate, the suicide rate was classified by three levels: “High”, “Medium”, “Low”. The observation in the 75% quantile of all observations’ suicide rate are classified as “High”, observations between 25% quantile and 75% quantile are classified as “Medium” and the observation below 25 % quantile are classified as “Low”.
+
+```{r, read-data, message = FALSE}
+suicide <- read.csv("/Users/apple/Downloads/suicide.csv")
+```
+
+```{r, data-wrangling}
+# use sql to select the data
+suicide <- sqldf("select country, year, sex, age, `suicides.100k.pop` as `suicides_100k`, `HDI.for.year` as `HDI_year`, `gdp_per_capita....` as `gdp_capita` from suicide")
+suicide <- sqldf("select * from suicide where year > 1999")
+
+count_na = table(is.na(suicide))
+check_na = sapply(suicide, function(x) sum(is.na(x)))
+
+# fitting missing value
+median = median(suicide$HDI_year[!is.na(suicide$HDI_year)])
+suicide$HDI_year[is.na(suicide$HDI_year)] = median
+
+# change data type for some category vairable to factor data type
+suicide$year = as.factor(suicide$year)
+
+# classify the suicide rate to low medium high level
+suicide$fatal_rate = factor(case_when(
+  suicide$suicides_100k > quantile(suicide$suicides_100k, 0.75) ~ "High",
+  suicide$suicides_100k > quantile(suicide$suicides_100k, 0.25) ~ "Medium", 
+  TRUE ~ "Low"
+))
+```
+
+```{r, data-splitting}
+set.seed(430)
+trn_idx = sample(nrow(suicide), size = 0.8 * nrow(suicide))
+suicide_trn = suicide[trn_idx, ]
+suicide_tst = suicide[-trn_idx,]
+```
+
+We also concern if the problem of data imbalance among different classes occuers, so we check the data and conclude that for this dataset there is no such problem existing.
+
+```{r, check data imbalance}
+# Check if the data is imbalance
+df_imbalance = suicide_trn %>%
+  group_by(fatal_rate) %>%
+  summarise(Tot_num = n())
+
+tibble("Fatal_rate" = df_imbalance$fatal_rate,
+       "Total Number" = df_imbalance$Tot_num)  %>% 
+  kable(caption = "Table: Check data imbalance",digits = 3) %>% 
+  kable_styling("striped", full_width = FALSE)
+```
+
+In preparation for model training, a training dataset is created using 80% of the provided data.
+
+## Modeling
+
+Two regression and four classification models were trained, each using 5-fold cross-validation. A best model was chosen for each regression and classification.
+
+### Regression Models
+
+- A linear regression model using all predictors is used to fit the training dataset.
+
+```{r, linear, echo = FALSE}
+set.seed(430)
+lm = train(
+  suicides_100k ~ .-fatal_rate, data = suicide_trn,
+  method = "lm",
+  trControl = trainControl(method = "cv", number = 5)
+)
+```
+
+- A kth-nearest neighbor model using all predictors is used to fit the training dataset.
+
+```{r, knn, echo = FALSE}
+set.seed(430)
+knn = train(
+  suicides_100k ~ .-fatal_rate, data = suicide_trn,
+  method = "knn",
+  trControl = trainControl(method = "cv", number = 5)
+)
+```
+
+### Classification Models
+
+```{r, train-control}
+cv_multi = trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = multiClassSummary)
+oob_multi = trainControl(method = "oob")
+```
+
+- A Random Forest model with oob resample method
+
+```{r, rf}
+set.seed(430)
+multi_mod_rf = train(
+  form = fatal_rate ~ . - suicides_100k, 
+  data = suicide_trn,
+  method = "rf",
+  trControl = oob_multi
+)
+```
+
+- A boosted model with cross validation resample method
+
+```{r, warning=FALSE, include=FALSE, boosted}
+set.seed(430)
+multi_mod_boosted = train(
+  form = fatal_rate ~ . - suicides_100k, 
+  data = suicide_trn,
+  method = "gbm",
+  trControl = cv_multi,
+  verbose = FALSE
+)
+
+```
+
+- A Multi nomial model with cross validation resampling method
+
+```{r, multinom}
+set.seed(430)
+multi_mod_multinom = train(
+  form = fatal_rate ~ . - suicides_100k,  
+  data = suicide_trn,
+  method = "multinom",
+  trControl = cv_multi,
+  trace = FALSE
+)
+```
+
+- A Neural network model with cross validation resample method
+
+```{r, nnet, warning=FALSE, include=FALSE}
+set.seed(430)
+multi_mod_nnet = train(
+  form = fatal_rate ~. -suicides_100k, 
+  data = suicide_trn,
+  method = "nnet",
+  trControl = cv_multi,
+  trace = FALSE
+)
+```
+Models selection and evaluation is discussed in the results section.
+
+***
+
+# Results
+
+For regression models, the table below shows the result of the RMSEs of the predicted suicide rates using the two regression models on the training dataset. As a result, the linear regression has a lower RMSE, and therefore, is chosen to fit the test dataset which obtains a RMSE of **12.488**.
+
+```{r, regression-test-results}
+# rmse table
+tibble(
+  "Models" = c("Linear Regression", "Knn Model"),
+  "Training RMSE" = c(12.47642, 16.62361),
+  "Rsquared" = c(0.5262068, 0.1810367),
+  "MAE" = c(8.241623, 10.06930)) %>% 
+  kable(caption = "Table: The Training RMSEs of the Two Regression Models",digits = 3) %>% 
+  kable_styling("striped", full_width = FALSE)
+```
+
+For the classification, The table below shows the result of each model with its highest accuracy rate and confusion matrices for the training dataset. Intermediate tuning results can be found in the appendix. Due to computational limitations, only three confusion matrices are presented. While the best result can be found within the random forest model. As a result, a random forest model classification is chosen since it has the highest accuracy rate which is much higher than others’.  
+
+Models were tuned for accuracy, but sensitivity was also considering when choosing a final model. Aside from random forest model, all models had similar performance.
+
+```{r}
+result = tibble("Model" = c("Random Forest", "Boosted Model", "Multinomial", "Nureal Network"),
+                 "Accuracy" = c(max(multi_mod_rf$results$Accuracy), max(multi_mod_boosted$results$Accuracy), max(multi_mod_multinom$results$Accuracy), max(multi_mod_nnet$results$Accuracy))) %>%
+  kable(caption = "Table: Model Accuracy",digits = 3) %>%
+  kable_styling("striped",  full_width = FALSE)
+result
+```
+
+```{r}
+confusionMatrix(multi_mod_boosted)$table %>%
+    kable(caption = "Table: **Multiclass boosted**, Cross-Validated 
+                       Multiclass Predictions versus Multiclass Response, Percent", digits = 3) %>% 
+    kable_styling("striped", full_width = FALSE) %>%
+    add_header_above(c(" " = 1, "True Number of Valves" = 3)) %>% 
+    column_spec(column = 1, bold = TRUE)
+
+confusionMatrix(multi_mod_multinom)$table %>%
+    kable(caption = "Table: **Multiclass multi nominial**, Cross-Validated 
+                       Multiclass Predictions versus Multiclass Response, Percent", digits = 3) %>% 
+    kable_styling("striped", full_width = FALSE) %>%
+    add_header_above(c(" " = 1, "True Number of Valves" = 3)) %>% 
+    column_spec(column = 1, bold = TRUE)
+
+confusionMatrix(multi_mod_nnet)$table %>%
+    kable(caption = "Table: **Multiclass neural network**, Cross-Validated 
+                       Multiclass Predictions versus Multiclass Response, Percent", digits = 3) %>% 
+    kable_styling("striped", full_width = FALSE) %>%
+    add_header_above(c(" " = 1, "True Number of Valves" = 3)) %>% 
+    column_spec(column = 1, bold = TRUE)
+```
+
+Within this test data, we can see the high accuracy from the confusion matrix of test data that the entries on the diagonal line are the highest ones in each row.
+
+```{r}
+tst_tab = table(
+  predicted = predict(multi_mod_rf, suicide_tst),
+  actual = suicide_tst$fatal_rate
+)
+
+rownames(tst_tab) = c("Predicted: High", "Predicted: Medium", "Predicted: Low")
+colnames(tst_tab) = c("High", "Medium", "Low")
+
+tst_tab %>% 
+  kable(digits = 3, caption = "Table: Test Results, **Random Forest Classification**") %>% 
+  kable_styling("striped", full_width = FALSE) %>%
+  add_header_above(c(" " = 1, "Truth" = 3)) %>% 
+  column_spec(column = 1, bold = TRUE)
+```
+
+***
+
+# Discussion
+
+While our regression model did not meet the expected outcomes, we believe this analysis demonstrates a proof-of-concept for suicide rate prediction system. Using more data, both samples and features, this model could likely be improved before being put into practice.
+
+Below is the predicted suicide rate plot by age using the linear regression model.
+
+```{r, linear-plot, warning=FALSE}
+predicted = predict(lm, suicide_tst)
+
+p_lm = ggplot(suicide_tst, aes(x = predicted, y = suicides_100k)) +
+  geom_point(aes(color = age)) +
+  facet_wrap(~ age) +
+  ggtitle(paste("Linear Regression: Predict Suicide Rates By Age")) +
+  xlab("Predicted Rates") + ylab("Actual Rates") +
+  geom_abline(intercept = 0, slope = 1)
+```
+
+Below is the predicted suicide rate plot by age using the linear model.
+
+```{r, knn-plot, warning=FALSE}
+predicted = predict(lm, suicide_tst)
+
+p_knn = ggplot(suicide_tst, aes(x = predicted, y = suicides_100k)) +
+  geom_point(aes(color = age)) +
+  facet_wrap(~ age) +
+  ggtitle(paste("Linear Regression: Predict Suicide Rates By Age")) +
+  xlab("Predicted Rates") + ylab("Actual Rates") +
+  geom_abline(intercept = 0, slope = 1)
+```
+
+```{r, print-plots-1, fig.height = 12, fig.width = 12}
+gridExtra::grid.arrange(p_lm, nrow = 1)
+```
+
+```{r, print-plots-2, fig.height = 12, fig.width = 12}
+gridExtra::grid.arrange(p_knn, nrow = 1)
+```
+
+RMSE in the knn model is higher than the linear regression and its plot shows an obvious spread of data points. Both graphs showed people whose ages are 75 years old or above tend to have a higher suicide rate than other groups. This finding could reveal some social issues. For example, do we care enough for the elderly in our family? Do we spend enough time with them and listening to their needs? It is an alarm bell for governments and people to pay more attention to aged people. Government could consider offering more social benefits to the elder and more time and care should be given to elderly people in the family.
+
+When choosing the metric to assess our model performance, we considered accuracy rate, specificity and sensitivity. We finally decided to use accuracy because we are more concerned about the degree to which the classification result of the suicide rate conforms to the correct value. If we were building the classification model under other situations, credit card fraud classification (genuine, fraud) for instance, we might care more about sensitivity or specificity. The most severe situation is the card that is actually fraud but is classified as genuine by mistake, which will cause a lag to the bank to solve the problem and make the person suffer from a huge loss. But the suicide rate classification is different. Since our goal is to provide suicide rate reference for each country, misclassifying any level of suicide rate will result in the country’s misinterpretation on those rates. Therefore we chose overall accuracy rate as the metric to examine our models.  
+
+We found classification results from random forest are the optimal and the visualization below shows a direct comparison between actual value and predicted value. Observations that are correctly classified are shown in blue and misclassified observations are displayed in red. We can see the majority of the observations are in blue, indicating a relatively high accuracy rate (87.04 %). We can conclude the random forest model performed well with current data. As we obtain more data in the future, this model could be improved before being put into practice.
+
+```{r}
+predicted = predict(multi_mod_rf, suicide_tst)
+df_plot = suicide_tst %>%
+  mutate(predicted_fatalrate = predicted) %>%
+  mutate(Accuracy = factor(ifelse(fatal_rate == predicted_fatalrate, "Yes", "No")))
+```
+
+```{r}
+accuracy = round(length(df_plot$Accuracy[df_plot$Accuracy == "Yes"])/length(df_plot$Accuracy)*100,2)
+```
+
+```{r}
+p_result = ggplot(df_plot, aes(x = predicted_fatalrate, y = fatal_rate, col = Accuracy)) + geom_point() + scale_color_manual(labels = c('No', 'Yes'), values = c('tomato','cornflowerblue')) + geom_jitter() + theme_bw()+ ggtitle(label = "Performance of Random Forest Model on test data", subtitle = paste0("Accuracy = ", accuracy,"%")) + xlab("Predicted") + ylab("Measured")
+```
+
+```{r, print-plots-3, fig.height = 12, fig.width = 12}
+gridExtra::grid.arrange(p_result, nrow = 1)
+```
+
+***
+
+# Appendix
+
+## Data Dictionary
+
+```{r, include = FALSE}
+names(suicide_trn)
+```
+
+- `country`: Name of country
+- `year`: Year of the suicide rate
+- `sex`: gender of the suicide
+- `age`: age of the suicide
+- `Suicides_no`: number of suicides
+- `population`: Country population
+- `suicide/100k`: pop: Number of suicide per 100,000 population, suicide rate
+- `Country-year`: Country and year
+- `HDI for year`: The Human Development Index: a statistic composite index of life expectancy, education, and per capita income indicators
+- `gdp_for_year` ($): Country gdp for the year
+- `gdp_per_capita` ($): Country's gross domestic product by its total population.
+- `Generation`: The generation range of the suicide 
+
+
+For additional information, see documentation on Kaggle.[^6]
+
+## EDA
+
+```{r, eda-numeric}
+## two tables
+suicide <- read.csv("/Users/apple/Downloads/suicide.csv")
+suicide <- sqldf("select country, year, sex, age, `suicides_no`, `population`, `suicides.100k.pop` as `suicides_100k`, `HDI.for.year` as `HDI_year`,`gdp_for_year....` / 1000000 as `gdp_year`, `gdp_per_capita....` as `gdp_capita`, generation from suicide")
+
+d1 <- sqldf("select country,sex, age, avg(`suicides_100k`) as mean_suicide_rate from suicide GROUP BY country,sex,age")
+d2 <- sqldf("select country, avg(`gdp_year`) as `gdp_year`, avg(`gdp_capita`) as `gdp_capita`, avg(`suicides_100k`) as mean_suicide_rate from suicide GROUP BY country")
+df_d1 = head(as_tibble(d1))
+df_d2 = head(as_tibble(d2))
+
+tibble("Country" = df_d1$country,
+       "Sex" = df_d1$sex,
+       "Age" = df_d1$age,
+       "Mean Suicide Rate" = df_d1$mean_suicide_rate)%>% 
+  kable(caption = "Table: Summary Statistics",digits = 3) %>% 
+  kable_styling("striped", full_width = FALSE)
+
+tibble("Country" = df_d2$country,
+       "GDP per Year" = df_d2$gdp_year,
+       "GDP per Capital" = df_d2$gdp_capita,
+       "Mean Suicide Rate" = df_d2$mean_suicide_rate)%>% 
+  kable(caption = "Table: Summary Statistics",digits = 3) %>% 
+  kable_styling("striped", full_width = FALSE)
+```
+
+```{r, eda-plots, fig.height = 4, fig.width = 14}
+## plot 1
+country_data <- suicide %>%
+  select(country, suicides_no, population) %>%
+  group_by(country) %>%
+  summarize(suicide_stats = round((sum(as.numeric(suicides_no))/sum(as.numeric(population)))*100000, 2))
+
+plot_country <- ggplot(country_data, aes(x=country_data$country, y=country_data$suicide_stats)) + 
+  geom_bar(stat = "identity", size = 4) +
+  labs(title="Suicides rate per country (per 100k)", 
+       x = "Country", y = "Suicides rate per 100k") +
+  coord_flip() +
+  theme_classic()
+#ggsave("country.png", width = 20, height = 30, units = "cm")
+
+## plot 2
+## remove the country with 0 suicides rate
+gender_data <- suicide %>%
+  group_by(country,sex) %>%
+  summarize(suicide_stats = (sum(as.numeric(suicides_no)) / sum(as.numeric(population))) * 100000)%>%
+  filter(suicide_stats > 0)
+
+sex_plot = ggplot(gender_data, aes(y = suicide_stats, x = country, fill = sex)) + 
+  geom_bar(position = "fill", stat = "identity") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Suicide distribution between sex per country", 
+       x = "Country", 
+       y = "Suicides per 100k",
+       fill = "Sex") + 
+  coord_flip() +
+  theme_classic()
+#ggsave("sex.png", width = 20, height = 30, units = "cm")
+
+## plot 3
+## remove the country with 0 suicides rate
+age_data <- suicide %>%
+  group_by(country,age) %>%
+  summarize(suicide_stats = (sum(as.numeric(suicides_no)) / sum(as.numeric(population))) * 100000) %>%
+  filter(suicide_stats > 0)
+
+age_plot = ggplot(age_data, aes(y = suicide_stats, x = country, fill = age)) + 
+  geom_bar(position = "fill", stat = "identity") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Suicide distribution between Age group", 
+       x = "Country", 
+       y = "Suicides per 100k",
+       fill = "Age") + 
+  coord_flip() +
+  theme_classic()
+#ggsave("age.png", width = 20, height = 30, units = "cm")
+
+## plot 4
+country_gdp_data <- suicide %>%
+  group_by(country) %>%
+  summarize(suicide_stats = (sum(as.numeric(suicides_no)) / sum(as.numeric(population))) * 100000, gdp_stats = mean(`gdp_capita`))
+
+gdp_plot <- ggplot(country_gdp_data, aes(x = gdp_stats, y = suicide_stats)) + 
+  geom_point() + 
+  scale_x_continuous(labels=scales::dollar_format(prefix="$")) + 
+  labs(title = "Correlation between GDP (per capita) and Suicide rate per 100k", 
+       x = "GDP (per capita)", 
+       y = "Suicides per 100k") +
+  theme(legend.position = "none") +
+  theme_classic()
+#ggsave("gdp.png", width = 30, height = 20, units = "cm")
+```
+
+```{r, print-eda-plots, fig.height = 64, fig.width = 24}
+gridExtra::grid.arrange(plot_country, sex_plot, age_plot, gdp_plot, nrow = 2)
+```
+
+***
+
+[^1]: [Kaggle: Suicide Rates Overview 1985 to 2016](https://www.kaggle.com/russellyates88/suicide-rates-overview-1985-to-2016)
+[^2]: United Nations Development Program. (2018). Human development index (HDI). Retrieved from http://hdr.undp.org/en/indicators/137506
+[^3]: World Bank. (2018). World development indicators: GDP (current US$) by country:1985 to 2016. Retrieved from http://databank.worldbank.org/data/source/world-development-indicators#
+[^4]: [Szamil]. (2017). Suicide in the Twenty-First Century [dataset]. Retrieved from https://www.kaggle.com/szamil/suicide-in-the-twenty-first-century/notebook
+[^5]: World Health Organization. (2018). Suicide prevention. Retrieved from http://www.who.int/mental_health/suicide-prevention/en/
